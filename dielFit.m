@@ -1,21 +1,21 @@
-function [rates,residuals,varmat,fitline] = dielFit(dates,conc,lat,lon,timezone,EmaxEk,EmaxEb,alpha)
+function [rates,residuals,varmat] = dielFit(mtime,conc,lat,lon,varargin)%EmaxEk,EmaxEb,alpha)
 %
-% function [rates,residuals,varmat,fitline] = dielFit(dates,conc,lat,lon,timezone)
-%          [rates,residuals,varmat,fitline] = dielFit(dates,conc,lat,lon,timezone,EmaxEk,EmaxEb)
-%          [rates,residuals,varmat,fitline] = dielFit(dates,conc,lat,lon,timezone,EmaxEk,EmaxEb,alpha)
+% function [rates,residuals,varmat,fitline] = dielFit(mtime,conc,lat,lon,timezone)
+%          [rates,residuals,varmat,fitline] = dielFit(mtime,conc,lat,lon,timezone,EmaxEk,EmaxEb)
+%          [rates,residuals,varmat,fitline] = dielFit(mtime,conc,lat,lon,timezone,EmaxEk,EmaxEb,alpha)
 %
-%   Computes rates of gross production and community respiration from diel 
+%   Computes rates of gross production and community respiration from diel
 %   cycles of oxygen concentration thorough ordinary linear least squares.
 %   Parameter confidence intervals and the variance-covariance matrix are
 %   computed via bootstrapping of residual with 200 iterations
 %   Residual autocorrelation is tested using the Durbin-Watson test.
-%   
+%
 %   Three models are used for rate estimation:
 %       1. Linear model - constant production during daytime
 %       2. Sinusoidal model - production scales linearly with light intensity
 %       3. P vs. E model - includes light saturation and photoinhibition
 %
-%   This function requires MATLAB ver 2013b or above, the Statistics and 
+%   This function requires MATLAB ver 2013b or above, the Statistics and
 %   Machine Learning Toolbox, and the routine suncycle.m to compute solar elevation
 %   (by C. Begler, available at http://mooring.ucsd.edu/software/matlab/doc/toolbox/geo/suncycle.html)
 %
@@ -35,7 +35,7 @@ function [rates,residuals,varmat,fitline] = dielFit(dates,conc,lat,lon,timezone,
 %       GPP and R, p-value from the Durbin-Watson test).
 %       Rate units are the same as input variable 'conc' per day.
 %   residuals: a matrix with the residuals from the three models reported
-%       in separate rows: linear on the 1st row, sinusoidal on the second 
+%       in separate rows: linear on the 1st row, sinusoidal on the second
 %       row, and P vs.E on the third row
 %   varmat: a structure with the variance-covariance matrix from the three
 %       models. The variance-covariance matrix is obtained using the
@@ -81,115 +81,106 @@ function [rates,residuals,varmat,fitline] = dielFit(dates,conc,lat,lon,timezone,
 %          bootstrapping the residuals
 %
 % Benedetto Barone - September 2018 - Revision 0.18
- 
-% Set default parameters for P vs E curve
-if nargin < 8, alpha = 0.317; end % 68.3% confidence intervals
-if nargin < 7, EmaxEb = 0; end % no photoinhibition
-if nargin < 6, EmaxEk = 1; end % Ek = maximum daily irradiance
- 
+
+p = inputParser;
+
+defaultAlpha = 0.317; % 68.3% confidence intervals
+defaultEmaxEk = 1; % no photoinhibition
+defaultEmaxEb = 0; % Ek == maximum daily irradiance
+
+defaultMethod = 'sin';
+validMethod = {'linear','sin','par'};
+checkMethod = @(x) any(validatestring(x,validMethod));
+
+
+addRequired(p,'mtime',@isnumeric);
+addRequired(p,'conc',@isnumeric);
+addRequired(p,'lat',@isnumeric);
+addRequired(p,'lon',@isnumeric);
+addParameter(p,'alpha',defaultAlpha,@isnumeric);
+addParameter(p,'EmaxEk',defaultEmaxEk,@isnumeric);
+addParameter(p,'EmaxEb',defaultEmaxEb,@isnumeric);
+addParameter(p,'method',defaultMethod,checkMethod);
+
+
+parse(p,mtime,conc,lat,lon,varargin{:});
+
+alpha = p.Results.alpha;
+EmaxEk = p.Results.EmaxEk;
+EmaxEb = p.Results.EmaxEb;
+method = p.Results.method;
+
+% get rid of any nans
+gd = ~isnan(mtime + conc);
+xfit = mtime(gd) - fix(min(mtime(gd))); yfit = conc(gd);
+
 nt = 240; % number of time points per day
 % Extract solar elevation cycle
-[~,t,~,z] = suncycle(lat,lon,nanmean(dates) - timezone/24,nt);
-% Transform t in local time and sort
-t = rem(t + timezone/24,1);
-[t,ind_row] = sort(t);
+timezone = 0;
+[~,t,~,z] = suncycle(lat,lon,mean(mtime,'omitnan') - timezone/24,nt);
+% Transform t 
+td = t - floor(min(t));
+ndays = ceil(max(td))+1;
+%[t,ind_row] = sort(t);
 % Normalized light intensity from solar elevation (1 is maximum light, Emax)
-z = z(ind_row);
+%z = z(ind_row);
 z(z < 0) = 0;
 Erel = sind(z);
- 
-tt = linspace(0,1,nt+1)';
+
+% edges of tbins
+tt = linspace(0,ndays,nt*ndays+1)';
+
+
+
 % 1. Linear production model
-Plin = zeros*t; Plin(Erel>0) = 1;
-Plin = interp1(t,Plin,tt,'linear','extrap');
-Plin = Plin./trapz(tt,Plin);
-% 2. Sinusoidal producion model (linear with light)
-Psin = Erel;
-Psin = interp1(t,Psin,tt,'linear','extrap');
-Psin = Psin./trapz(tt,Psin);
-% 3. PvsE producion model
-Psat = (1-exp(-EmaxEk.*Erel)).*exp(-EmaxEb.*Erel);
-Psat = interp1(t,Psat,tt,'linear','extrap');
-Psat = Psat./trapz(tt,Psat);
- 
-% Allow model fit on multiple days
-nday = max(dates - min(fix(dates)));
-nday = ceil(nday);
-if nday > 1
-    tt_new = tt;
-    for i = 2:nday
-        tt_new = [tt_new; tt(2:end)+(i-1)];
-    end
-    tt = tt_new;
-    Plin = [Plin; repmat(Plin(2:end),nday-1,1)];
-    Psin = [Psin; repmat(Psin(2:end),nday-1,1)];
-    Psat = [Psat; repmat(Psat(2:end),nday-1,1)];
+if strcmpi(method,'linear')
+    P = zeros*td;
+    P(Erel>0) = 1;
+    
+    % 2. Sinusoidal producion model (linear with light)
+elseif strcmpi(method,'sin')
+    P = Erel;
+elseif strcmpi(method,'par')
+    % 3. PvsE producion model
+    P = (1-exp(-EmaxEk.*Erel)).*exp(-EmaxEb.*Erel);
+else
+    error('oops')
 end
- 
-i_nan = isnan(dates) | isnan(conc);
-xfit = dates(~i_nan) - fix(min(dates(~i_nan))); yfit = conc(~i_nan);
-% Define fit type using Linear Model Terms
-Alin = [ones(length(xfit),1) interp1(tt,cumtrapz(tt,Plin),xfit)' -xfit'];
-Asin = [ones(length(xfit),1) interp1(tt,cumtrapz(tt,Psin),xfit)' -xfit'];
-Asat = [ones(length(xfit),1) interp1(tt,cumtrapz(tt,Psat),xfit)' -xfit'];
+Pt = interp1(td,P,tt,'linear','extrap');
+Ptn = Pt./trapz(tt,Pt);
+A = [ones(length(xfit),1) interp1(tt,cumtrapz(tt,Ptn),xfit)' -xfit'];
+
 % Fit moddels
-par_lin = Alin\yfit';
-par_sin = Asin\yfit';
-par_sat = Asat\yfit';
+par = A\yfit';
 % Residuals
-res_lin = yfit'-Alin*par_lin;
-res_sin = yfit'-Asin*par_sin;
-res_sat = yfit'-Asat*par_sat;
-% Y from the models
-y_lin = Alin*par_lin;
-y_sin = Asin*par_sin;
-y_sat = Asat*par_sat;
+resid = yfit'-A*par;
+% Y predicted from the model fit
+y_hat = A*par;
+
 % Bootstrap residual to compute parameter confidence intervals (200 iterations)
-boot_lin = bootstrp(200,@(bootr) Alin\(y_lin+bootr),res_lin);
-boot_sin = bootstrp(200,@(bootr) Asin\(y_sin+bootr),res_sin);
-boot_sat = bootstrp(200,@(bootr) Asat\(y_sat+bootr),res_sat);
+boot = bootstrp(200,@(bootr) A\(y_hat+bootr),resid);
+
 % Confidence intervals
-ci_lin = [prctile(boot_lin,(alpha/2)*100)' prctile(boot_lin,(1-alpha/2)*100)'];
-ci_sin = [prctile(boot_sin,(alpha/2)*100)' prctile(boot_sin,(1-alpha/2)*100)'];
-ci_sat = [prctile(boot_sat,(alpha/2)*100)' prctile(boot_sat,(1-alpha/2)*100)'];
+ci = [prctile(boot,(alpha/2)*100)' prctile(boot,(1-alpha/2)*100)'];
+
 % Model statistics (R^2 and p value)
-[r_temp,p_temp] = corrcoef(yfit,y_lin);
-rsq_lin = r_temp(2)^2; pval_lin = p_temp(2);
-[r_temp,p_temp] = corrcoef(yfit,y_sin);
-rsq_sin = r_temp(2)^2; pval_sin = p_temp(2);
-[r_temp,p_temp] = corrcoef(yfit,y_sat);
-rsq_sat = r_temp(2)^2; pval_sat = p_temp(2);
+[r_temp,p_temp] = corrcoef(yfit,y_hat);
+rsq = r_temp(2)^2;
+pval = p_temp(2);
+
 % Variance-covariance matrix from bootstrap
-varmat.lin = cov(boot_lin);
-varmat.sin = cov(boot_sin);
-varmat.sat = cov(boot_sat);
+varmat = cov(boot);
 % Durbin-Watson test for residual autocorrelation
-[pdw_lin,~] = dwtest(res_lin,Alin);
-[pdw_sin,~] = dwtest(res_sin,Asin);
-[pdw_sat,~] = dwtest(res_sat,Asat);
+pdw = dwtest(resid,A);
 % Output variables
-rates = [par_lin(2:3)';par_sin(2:3)';par_sat(2:3)'];
-rates = table(rates(:,1),rates(:,2),[par_lin(1); par_sin(1);par_sat(1)],[rsq_lin;rsq_sin;rsq_sat],[pval_lin;pval_sin;pval_sat]);
-rates.Properties.VariableNames = {'GPP','CR','C0','R2','p'};
-rates.GPPci = [ci_lin(2,:);ci_sin(2,:);ci_sat(2,:)];
-rates.CRci = [ci_lin(3,:);ci_sin(3,:);ci_sat(3,:)];
-rates.C0ci = [ci_lin(1,:);ci_sin(1,:);ci_sat(1,:)];
-rates.pdw = [pdw_lin; pdw_sin; pdw_sat];
-rates.Properties.RowNames = {'linear','sinusoidal','P vs E'};
-residuals = [res_lin'; res_sin' ; res_sat'];
- 
-% Plot results
-yy_lin = par_lin(1)+cumtrapz(tt,par_lin(2)*Plin)-par_lin(3)*tt;
-yy_sin = par_sin(1)+cumtrapz(tt,par_sin(2)*Psin)-par_sin(3)*tt;
-yy_sat = par_sat(1)+cumtrapz(tt,par_sat(2)*Psat)-par_sat(3)*tt;
-plot(xfit,yfit,'ko',tt,[yy_lin yy_sin yy_sat],'MarkerFaceColor',[0.7 0.7 0.7])
-xlabel('decimal day'); ylabel('concentration')
-set(gca,'Fontsize',18)
-lg = legend('data points','linear model','sinusoidal model','P vs E model','location','NorthWest'); set(lg,'Fontsize',18)
-xlim([min(xfit) max(xfit)])
- 
-% Fit line output
-fitline = table(tt+fix(min(dates(~i_nan))), yy_lin, yy_sin, yy_sat);
-fitline.Properties.VariableNames = {'date','linear','sinusoidal','PvsE'};
- 
+rates = table;
+rates.GPP = par(2);
+rates.CR = par(3);
+rates.C0 = par(1);
+rates.R2 = rsq;
+rates.p = pval;
+rates.pdw = pdw;
+residuals = resid;
+
+
 end
